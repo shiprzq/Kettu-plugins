@@ -1,8 +1,8 @@
 # Hidden Channels — Kettu plugin
 
-Reveals the channels your roles can't see, renders them in the server list, and gives you a full intel panel on every one: name, topic, channel id, type, creation date, resolved permission-overwrite matrix with role and member names, your effective permission bits, and a live API probe that reports exactly what Discord's servers hand back.
+Reveals the channels your roles can't see, gives you a **Hidden channels** button on every server, and opens a full intel panel on each one: name, topic, channel id, type, creation date, resolved permission-overwrite matrix with role and member names, your effective permission bits, and a live API probe that reports exactly what Discord's servers hand back.
 
-Written against Kettu's Vendetta-compat plugin loader (the same surface Bunny and Revenge expose). Single file, no build step, no bundling, no npm deps at runtime.
+Written against Kettu's Vendetta-compat plugin loader. Single file, no build step, no runtime deps.
 
 ```
 HiddenChannels/
@@ -11,74 +11,68 @@ HiddenChannels/
 ├── package.json      ← test harness only
 └── test/
     ├── fixture.js    ← fake Discord client
-    ├── harness.js    ← logic tests
-    └── render.js     ← renders the settings UI with real React
+    ├── harness.js    ← logic + entry-point tests
+    └── render.js     ← renders both screens with real React
 ```
 
 ## Install
 
-1. Serve this folder over HTTP on the same network as the phone:
-
-   ```
-   npx --yes http-server . -p 4040 -c-1
-   ```
-
-2. On the phone: **Settings → General → Developer Settings** (enable it).
-3. **Settings → Plugins → +** and paste the folder URL, trailing slash included:
-
-   ```
-   http://192.168.x.x:4040/
-   ```
-
-4. Accept the loader warning, enable **Hidden Channels**, restart Discord.
-
-If the plugin list shows a hash error, the manifest hash doesn't match `index.js`. Recompute:
-
 ```
-sha256sum index.js
+https://shiprzq.github.io/Kettu-plugins/
 ```
 
-## What you get
+Settings → Plugins → **+** → paste (trailing slash) → Install → enable → restart.
 
-**Settings → Plugins → Hidden Channels** opens the panel.
+## The button
 
-- A list of every channel in every server you're in where your computed permissions lack `VIEW_CHANNEL`. Sorted by server, with type and a topic preview.
-- Tap one for the intel panel:
-  - channel name, type, category, creation date, nsfw flag, slowmode, ids
-  - your effective permission bits, plus explicit granted/denied pills for `VIEW_CHANNEL`, `SEND_MESSAGES`, `READ_MESSAGE_HISTORY`
-  - every permission overwrite, resolved: `@everyone`, then roles by name, then member overwrites by username, each with its allow and deny bit lists in readable form
+Two entry points, armed at load:
+
+| Surface | How it lands |
+| --- | --- |
+| Server long-press / server sheet (`showSimpleActionSheet`) | a **Hidden channels** row appended to the option list |
+| Lazily-imported guild and channel sheets (`openLazy`) | a row cloned from the sheet's own first row, appended to the same array |
+
+The row opens a modal panel scoped to that server. Sheets that aren't about a server — message actions, generic prompts — are left untouched: the hook only fires when the payload carries a guild object, or a channel that resolves to one.
+
+If neither hook finds its module, the settings page says so under **Surfaces** instead of failing silently. `settings` is the export Kettu actually reads (`pluginInstance[id]?.settings`); `Settings` is exported too for Vendetta-proper compatibility. Both render the same page.
+
+## What the panel shows
+
+- Every channel in scope where your computed permissions lack `VIEW_CHANNEL`, grouped by server.
+- Tap one:
+  - name, type, category, creation date, nsfw, slowmode, ids
+  - your effective permission bits, plus granted/denied pills for `VIEW_CHANNEL`, `SEND_MESSAGES`, `READ_MESSAGE_HISTORY`
+  - every overwrite resolved: `@everyone`, roles by name, member overwrites by username, each with readable allow/deny lists
   - **probe now** — one REST call for the channel's history, and the server's answer printed verbatim
   - **copy intel as json**
 
-Two live overrides, toggleable:
+Two live overrides, toggleable in settings:
 
 | Toggle | What it does |
 | --- | --- |
-| Reveal locked channels in the sidebar | forces `VIEW_CHANNEL` through the local permission store so the channel list renders locked channels |
-| Open the composer in locked channels | forces `SEND_MESSAGES` locally so the composer isn't disabled |
+| Reveal locked channels in the sidebar | forces `VIEW_CHANNEL` through the local permission store |
+| Open the composer in locked channels | forces `SEND_MESSAGES` so the composer isn't disabled |
 
 ## The wall, stated once
 
-Discord computes permissions on the server. Two consequences you should design around:
+Discord computes permissions server-side.
 
-1. **Channel metadata is yours.** `GUILD_CREATE` sends every channel in a server — ids, names, topics, types, positions, and the full `permission_overwrites` bitfields — regardless of whether you can view it. The client just filters it out of the UI. That's the whole reason this plugin works: it re-reads the cache your gateway connection already holds and does its own overwrite math instead of trusting the filtered view.
-2. **Message content and sends are not.** Your client only receives `MESSAGE_CREATE` for channels its gateway subscription covers, and that subscription is computed server-side from `VIEW_CHANNEL`. `GET /channels/{:id}/messages` answers `403 {"code": 50001, "message": "Missing Access"}`. No client patch changes that — there is no message data in the process to un-hide. Same for sending: the composer opening is local, the `POST` is judged remotely.
+1. **Channel metadata is yours.** `GUILD_CREATE` sends every channel — ids, names, topics, types, positions, full `permission_overwrites` — whether you can view it or not. The client filters it out of the UI. That's why this works: it re-reads the cache the gateway already holds and does its own overwrite math.
+2. **Message content and sends are not.** Your client only receives `MESSAGE_CREATE` for channels its gateway subscription covers, and that's computed server-side from `VIEW_CHANNEL`. `GET /channels/{:id}/messages` answers `403 {"code": 50001, "message": "Missing Access"}`. No client patch changes that — there's no message data in the process to un-hide. Sending is the same shape: the composer opening is local, the `POST` is judged remotely.
 
-So the plugin gives you everything that exists locally (which is a lot — names, topics, and the complete access map of every private channel in the server) and surfaces the server's verdict honestly for the rest, rather than leaving you staring at a blank screen guessing whether it broke.
+So the panel gives you everything that exists locally and surfaces the server's verdict for the rest, rather than leaving you guessing.
 
 ## How the patches work
 
 ```
 PermissionStore.can*                → wrapped, returns true when the asked bit is one we force
-PermissionStore.compute*            → wrapped, ORs the forced bits into the returned bitfield
+PermissionStore.compute*            → wrapped, ORs the forced bits into the bitfield
 PermissionStore.getUserPermissions* → same treatment
 ```
 
-Discovery is name-driven, not hardcoded: at load the plugin walks the permission store and wraps every function matching `/^(can|compute|getUserPermissions|getChannelPermissions)/i`, then detects which style it is by return type (`boolean` vs bitfield) so both old and new Discord builds work. All wrappers are registered through `patcher.instead` and dropped in `onUnload`, so disabling the plugin restores the client to stock.
+Discovery is name-driven: the plugin walks the permission store for `/^(can|compute|getUserPermissions|getChannelPermissions)/i`, detects boolean vs bitfield by return type, and registers every wrapper through `patcher.instead`, all dropped in `onUnload`.
 
-Store resolution tries `findByStoreName` first, then `findByProps` on the store's method signature, so a renamed store or a reshuffled internals build degrades to "reveal skipped, intel panel still works" instead of a crash. Every lookup is wrapped; a missing store logs a warning and the rest of the plugin keeps running.
-
-The permission math in the panel is computed locally and never routed through the patched store, so the numbers you see are the truth and not the override:
+The permission math in the panel is computed locally and never routed through the patched store, so the numbers you see are the truth rather than the override:
 
 ```
 base = @everyone role bits ∪ every role the member holds
@@ -86,14 +80,14 @@ owner or ADMINISTRATOR → all bits
 apply @everyone overwrite, then role overwrites, then member overwrite
 ```
 
-Bitfields are `BigInt` throughout — Discord is past 32 bits and JS bitwise ops truncate.
+Bitfields are `BigInt` — Discord is past 32 bits and JS bitwise ops truncate.
 
 ## Troubleshooting
 
-- **Nothing listed** → enable **Debug logging**, reload, check the console for `loaded [...]`. If stores are missing, Discord moved them; the log names exactly which ones.
-- **Sidebar unchanged but the panel works** → `PermissionStore` renames. The panel's own detection is independent of the patch layer, which is why it still finds channels.
-- **Probe says `REST module not found`** → the REST client signature changed; update the `byProps("get","post",...)` probe list in `resolveStores`.
-- **Channels appear but messages are empty** → expected, see *The wall* above.
+- **No row in the server menu** → settings → **Surfaces**. If both say *not found*, turn on **Debug logging**, reload, and check the console for the store list.
+- **Panel empty** → open a server first so the guild list populates, then reopen.
+- **Probe says `REST module not found`** → the REST client signature moved; update the predicate in `resolveStores`.
+- **Channels appear, messages don't** → expected, see *The wall*.
 
 ## Tests
 
@@ -102,8 +96,6 @@ npm install
 npm test
 ```
 
-`harness.js` loads `index.js` the identical way Kettu does — `vendetta => { return <bundle> }` — against a fake client with three visibility cases (deny at `@everyone`, deny overridden by a role, deny overridden by a member overwrite) and asserts the patch layer installs and cleanly uninstalls.
+`harness.js` loads `index.js` the identical way Kettu does — `vendetta => { return <bundle> }` — against a fake shim: export shape (`settings` + `Settings`), entry-point arming, row injection into a server sheet, duplicate suppression, non-guild sheets left clean, permission math across three visibility cases, and clean unload.
 
-`render.js` mounts the settings screen with a real React renderer, walks the tree, taps a locked channel, checks every section renders, fires the probe, taps back, and flips both overrides — including verifying that disabling them restores the stock permission check.
-
-This is the part that catches the regressions you'd otherwise only see on the phone.
+`render.js` mounts both screens with a real React renderer: settings page, channel row tap, detail panel, probe, back navigation, the server-scoped panel launched the way a tap launches it, and the toggle→patch→unpatch contract.
