@@ -82,8 +82,20 @@ apply @everyone overwrite, then role overwrites, then member overwrite
 
 Bitfields are `BigInt` — Discord is past 32 bits and JS bitwise ops truncate.
 
+## No toasts, on purpose
+
+Kettu's toast helper builds its payload without a `position` field, and Discord's `ToastContainer` reads that field at render:
+
+```
+TypeError: Cannot read property 'position' of undefined
+    at useToastContainer
+```
+
+Any `showToast` call on this build takes the whole app down, so this plugin never makes one. Feedback goes to the log and to the **Last load** card on the settings page — version, timestamp, surface status, and the last few events.
+
 ## Troubleshooting
 
+- **App crash-loops after enabling** → the served bundle is refetched before it's started, so shipping a fix to the same URL clears it on next launch. If it won't boot, disable Kettu's bundle from the loader app or clear Discord's data.
 - **No row in the server menu** → settings → **Surfaces**. If both say *not found*, turn on **Debug logging**, reload, and check the console for the store list.
 - **Panel empty** → open a server first so the guild list populates, then reopen.
 - **Probe says `REST module not found`** → the REST client signature moved; update the predicate in `resolveStores`.
