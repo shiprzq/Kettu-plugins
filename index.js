@@ -10,7 +10,7 @@
   var patcher = V.patcher;
   var logger = V.logger || console;
 
-  var VERSION = "2.0.2";
+  var VERSION = "2.1.0";
   var DEFAULTS = {
     reveal: true,        // force VIEW_CHANNEL through the local permission store
     attemptSend: true,   // force SEND_MESSAGES so the composer opens (server still decides)
@@ -72,7 +72,8 @@
     loadedAt: null,
     error: null,
     events: [],
-    probe: "no sheet activity recorded yet"
+    probe: "no sheet activity recorded yet",
+    scan: null
   };
 
   var EVENT_LIMIT = 40;
@@ -134,7 +135,12 @@
     stores.User = byName("UserStore") || byProps("getUser", "getCurrentUser");
     stores.Member = byName("GuildMemberStore") || byProps("getMember", "getMembers");
     stores.Role = byName("GuildRoleStore") || byProps("getRoles", "getSortedRoles");
-    stores.Permission = byName("PermissionStore") || byProps("computePermissions", "can");
+    // Signature used by the shipped cloudburst/cloudburst-derived plugins on this
+    // client; findByStoreName is not reliable for this one.
+    stores.Permission = byProps("getChannelPermissions", "can") ||
+                        byName("PermissionStore") ||
+                        byProps("computePermissions", "can");
+    stores.Notifications = byProps("hasUnread", "hasUnreadPins", "getMentionCount");
     stores.GuildChannel = byName("GuildChannelStore") || byProps("getSortedChannels");
 
     stores.Rest = findModule(function (m) {
@@ -781,6 +787,18 @@
           h(RN.Text, { key: "n", style: { color: C.dim, fontSize: 11, marginTop: 6 } },
             "Open a server menu, come back here, and this line shows what the sheet handed us. Copy it to me if the row is still missing."),
           h(Btn, {
+            key: "scan", label: "scan ui modules", flat: true,
+            onPress: function () {
+              scanUiModules();
+              setTick(tick + 1);
+            }
+          }),
+          state.scan ? h(RN.Text, {
+            key: "scanout",
+            style: { color: C.dim, fontSize: 10, marginTop: 6, fontFamily: "monospace" }
+          }, "scanned " + state.scan.scanned + " \u00b7 " + state.scan.hits.length + " hits\n" +
+             state.scan.hits.slice(0, 30).join("\n")) : null,
+          h(Btn, {
             key: "copy", label: "copy diagnostics", flat: true,
             onPress: function () {
               var clip = attempt(function () { return metro.common.clipboard; }) || byProps("setString", "getString");
@@ -790,6 +808,7 @@
                 "surfaces " + JSON.stringify(entryPoints),
                 "stores " + Object.keys(stores).filter(function (k) { return !!stores[k]; }).join(","),
                 "probe " + state.probe,
+                "scan " + (state.scan ? JSON.stringify(state.scan) : "none"),
                 "events:",
                 state.events.slice(-20).join("\n")
               ].join("\n");
@@ -924,56 +943,109 @@
     }
   }
 
+  // Real visibility for a channel, computed from raw data so it stays correct
+  // no matter what we have patched. Used to decide unread badges.
+  function reallyHidden(channel) {
+    if (!channel) return false;
+    var gid = channel.guild_id;
+    var guild = gid ? guildById(gid) : null;
+    var me = currentUser();
+    if (!guild || !me) return false;
+    return (computePerms(guild, channel, me.id) & bit("VIEW_CHANNEL")) === 0n;
+  }
+
   function applyPatches() {
     dropPermPatches();
-    if (!cfg.reveal && !cfg.attemptSend) return;
 
     var storeObj = stores.Permission;
-    if (!storeObj) {
-      logger.warn("[HiddenChannels] PermissionStore not found, sidebar reveal skipped");
+    if (!storeObj || typeof storeObj.can !== "function") {
+      logger.warn("[HiddenChannels] permission store not found, reveal skipped");
+      state.probe = "permission store missing";
       return;
     }
+    state.probe = "permission store found";
 
-    var forceBits = 0n;
-    if (cfg.reveal) forceBits |= bit("VIEW_CHANNEL");
-    if (cfg.attemptSend) forceBits |= bit("SEND_MESSAGES");
-    if (forceBits === 0n) return;
+    var viewBit = bit("VIEW_CHANNEL");
+    var sendBit = bit("SEND_MESSAGES");
 
-    var targets = [];
-    for (var key in storeObj) {
-      if (typeof storeObj[key] !== "function") continue;
-      if (!/^(can|compute|getUserPermissions|getChannelPermissions)/i.test(key)) continue;
-      targets.push(key);
-    }
-    dbg("patching permission methods:", targets.join(", "));
+    // Exactly what the shipped hidden-channel plugins do on this client:
+    // answer VIEW_CHANNEL with true, and let everything else through.
+    pushPerm(patcher.after("can", storeObj, function (args, result) {
+      var asked = args && args[0];
+      if (asked === undefined || asked === null) return result;
+      var target = args[1];
+      if (target && target.realCheck) return result;
 
-    targets.forEach(function (name) {
-      var kind = /^can/i.test(name) ? "bool" : "bits";
-      pushPerm(patcher.instead(name, storeObj, function (args, orig) {
-        var result = orig.apply(this, args);
-        var target = null;
-        for (var i = 0; i < args.length; i++) {
-          var a = args[i];
-          if (a && typeof a === "object" && a.guild_id && a.id && a.type !== undefined) { target = a; break; }
-        }
-        if (!target) return result;
+      var askedBits;
+      try { askedBits = BigInt(asked); } catch (e) { return result; }
 
-        if (kind === "bool") {
-          if (result === false) {
-            var permArg = args.find(function (a) {
-              return typeof a === "number" || typeof a === "bigint" || typeof a === "string";
-            });
-            var asked = permArg === undefined ? 0n : BigInt(permArg);
-            if ((asked & forceBits) !== 0n) return true;
-          }
+      if (cfg.reveal && askedBits === viewBit) return true;
+      if (cfg.attemptSend && askedBits === sendBit) return true;
+      return result;
+    }));
+    note("patched can() \u00b7 reveal " + cfg.reveal + " \u00b7 send " + cfg.attemptSend);
+
+    // Unread pips and mention counts leak permission state; suppress them for
+    // channels that are genuinely hidden so the list doesn't advertise itself.
+    var notes = stores.Notifications;
+    if (notes) {
+      ["hasUnread", "hasUnreadPins", "hasRelevantUnread", "getMentionCount"].forEach(function (name) {
+        if (typeof notes[name] !== "function") return;
+        pushPerm(patcher.after(name, notes, function (args, result) {
+          var ch = args && args[0];
+          var channel = typeof ch === "string" ? channelById(ch) : ch;
+          if (channel && reallyHidden(channel)) return name === "getMentionCount" ? 0 : false;
           return result;
-        }
-        if (typeof result === "number") return Number(BigInt(result) | forceBits);
-        if (typeof result === "bigint") return result | forceBits;
-        if (typeof result === "string" && /^\d+$/.test(result)) return (BigInt(result) | forceBits).toString();
-        return result;
-      }));
-    });
+        }));
+      });
+    }
+  }
+
+  /* Runtime scan: which UI modules this client actually exposes. Feeds the
+     Diagnostics card so the next patch can be written against real names
+     instead of guesses. */
+
+  function scanUiModules() {
+    var hits = [];
+    var scanned = 0;
+    var interesting = /guild|channel|header|overview|sheet|action|menu|list|nav/i;
+
+    function consider(value) {
+      if (!value) return;
+      var name = value.displayName || value.name;
+      if (typeof name !== "string" || name.length < 3) return;
+      if (!interesting.test(name)) return;
+      if (hits.indexOf(name) === -1) hits.push(name);
+    }
+
+    try {
+      var mods = metro.modules || {};
+      var ids = Object.keys(mods);
+      for (var i = 0; i < ids.length && scanned < 6000; i++) {
+        scanned++;
+        try {
+          var raw = mods[ids[i]];
+          var exp = raw && raw.exports !== undefined ? raw.exports : raw;
+          if (!exp) continue;
+          if (typeof exp === "function") consider(exp);
+          else if (typeof exp === "object") {
+            consider(exp);
+            var keys = Object.keys(exp);
+            for (var k = 0; k < keys.length && k < 40; k++) {
+              var v = exp[keys[k]];
+              if (v && (typeof v === "function" || typeof v === "object")) consider(v);
+            }
+          }
+        } catch (e) { /* lazy module threw, skip */ }
+      }
+    } catch (e) {
+      note("scan failed: " + ((e && e.message) || e));
+    }
+
+    hits.sort();
+    state.scan = { scanned: scanned, hits: hits.slice(0, 120) };
+    note("scanned " + scanned + " modules \u00b7 " + hits.length + " name hits");
+    return state.scan;
   }
 
   function hideSheet() {
@@ -1091,7 +1163,17 @@
     }));
   }
 
-  /* 2. lazily-imported sheets */
+  /* 2. lazily-imported screens and sheets */
+
+  function labelOf(row) {
+    if (!row || typeof row !== "object") return null;
+    if (typeof row.label === "string") return row.label;
+    if (row.props && typeof row.props.label === "string") return row.props.label;
+    return null;
+  }
+
+  var GUILD_SCREEN_SIGNATURES = ["Mark As Read", "Mark as Read", "Channels & Roles", "Channels and Roles"];
+
   function patchLazySheets() {
     var lazy = stores.LazySheet;
     if (!lazy || typeof lazy.openLazy !== "function") {
@@ -1106,11 +1188,10 @@
         var key = args[1];
         var context = args[2];
 
-        var guild = guildFrom(context);
-        state.probe = "openLazy " + String(key) + " \u00b7 guild " + (guild ? "yes" : "no");
-        note("openLazy " + String(key) + " \u00b7 " + shape(context).slice(0, 220));
+        var known = guildFrom(context);
+        state.probe = "openLazy " + String(key) + " \u00b7 guild " + (known ? "yes" : "no");
+        note("openLazy " + String(key) + " \u00b7 " + shape(context).slice(0, 200));
 
-        if (!guild) return;
         if (!component || typeof component.then !== "function") return;
 
         component.then(function (instance) {
@@ -1118,19 +1199,33 @@
           pushMenu(patcher.after("default", instance, function (props, tree) {
             try {
               if (!tree) return tree;
+
               var rows = rowArrayIn(tree, 0, []);
-              if (rows && addRow(rows, guild)) {
-                note("row added to lazy sheet " + String(key) + " \u00b7 " + guildName(guild));
-                return tree;
+              if (!rows) return tree;
+
+              var labels = [];
+              for (var i = 0; i < rows.length && i < 40; i++) {
+                var l = labelOf(rows[i]);
+                if (l) labels.push(l);
               }
-              var utils = V.utils || {};
-              if (typeof utils.findInReactTree === "function") {
-                var located = utils.findInReactTree(tree, function (node) {
-                  return Array.isArray(node) && node.length && node.every(isRowish) && node.some(isRowLike);
-                });
-                if (located && addRow(located, guild)) {
-                  note("row added via findInReactTree \u00b7 " + guildName(guild));
-                }
+
+              var isGuildScreen = false;
+              for (var j = 0; j < GUILD_SCREEN_SIGNATURES.length; j++) {
+                if (labels.indexOf(GUILD_SCREEN_SIGNATURES[j]) !== -1) { isGuildScreen = true; break; }
+              }
+
+              var guild = guildFrom(props) || known;
+              if (!guild && isGuildScreen && props) {
+                guild = guildById(props.guildId || props.guild_id ||
+                  (props.route && props.route.params && props.route.params.guildId));
+              }
+
+              // A screen that lists server actions but carries no guild we can
+              // name is not worth a row that would open the wrong server.
+              if (!guild) return tree;
+
+              if (addRow(rows, guild)) {
+                note("row added \u00b7 " + String(key) + " \u00b7 " + guildName(guild));
               }
             } catch (e) {
               note("lazy inject failed: " + ((e && e.message) || e));
