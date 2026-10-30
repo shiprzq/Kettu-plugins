@@ -66,15 +66,18 @@ Discord computes permissions server-side.
 
 So the panel gives you everything that exists locally and surfaces the server's verdict for the rest, rather than leaving you guessing.
 
+## Server overview screen
+
+Tapping the server header on current Android builds opens a full screen — "Mark As Read", "Channels & Roles", "Permissions" — not an option sheet. That screen is caught by name-agnostic signature matching: the `openLazy` hook patches whatever component comes back, and at render time looks for a row list containing those labels. If it finds one and the guild resolves from props, the **Hidden channels** row is appended.
+
 ## How the patches work
 
 ```
-PermissionStore.can*                → wrapped, returns true when the asked bit is one we force
-PermissionStore.compute*            → wrapped, ORs the forced bits into the bitfield
-PermissionStore.getUserPermissions* → same treatment
+PermissionStore.can          → after(): answers true for VIEW_CHANNEL, and SEND_MESSAGES if enabled
+Notifications.hasUnread*     → after(): unread pips and mention counts suppressed for genuinely hidden channels
 ```
 
-Discovery is name-driven: the plugin walks the permission store for `/^(can|compute|getUserPermissions|getChannelPermissions)/i`, detects boolean vs bitfield by return type, and registers every wrapper through `patcher.instead`, all dropped in `onUnload`.
+The store is located with `findByProps("getChannelPermissions", "can")` — the same signature the shipped cloudburst-derived hidden-channel plugin uses on this client. `findByStoreName` is not reliable for it. Every wrapper is registered through the patcher and dropped in `onUnload`.
 
 The permission math in the panel is computed locally and never routed through the patched store, so the numbers you see are the truth rather than the override:
 
