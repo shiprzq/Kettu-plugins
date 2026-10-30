@@ -10,7 +10,7 @@
   var patcher = V.patcher;
   var logger = V.logger || console;
 
-  var VERSION = "2.0.0";
+  var VERSION = "2.0.1";
   var DEFAULTS = {
     reveal: true,        // force VIEW_CHANNEL through the local permission store
     attemptSend: true,   // force SEND_MESSAGES so the composer opens (server still decides)
@@ -60,10 +60,27 @@
     log.apply(null, arguments);
   }
 
-  function toast(message) {
+  /* Kettu's toast helper builds a payload without `position`, and Discord's
+     ToastContainer reads that field at render:
+       TypeError: Cannot read property 'position' of undefined
+     at useToastContainer
+     Any showToast() call on this build takes the whole app down, so this
+     plugin never calls it. Status goes to the log and to the settings page. */
+
+  var state = {
+    version: VERSION,
+    loadedAt: null,
+    error: null,
+    events: []
+  };
+
+  function note(message) {
     try {
-      if (V.ui && V.ui.toasts && V.ui.toasts.showToast) V.ui.toasts.showToast(String(message));
-    } catch (e) { /* toast is best-effort */ }
+      var line = String(message);
+      state.events.push(line);
+      if (state.events.length > 12) state.events.shift();
+      log(line);
+    } catch (e) { /* diagnostics are best-effort */ }
   }
 
   /* ------------------------------------------------------------ metro find */
@@ -534,7 +551,7 @@
         };
         if (clip && clip.setString) {
           clip.setString(JSON.stringify(payload, null, 2));
-          toast("Channel intel copied");
+          note("copied channel intel for " + (ch.name || ch.id));
         }
       }
 
@@ -685,7 +702,7 @@
         writeCfg();
         applyPatches();
         setTick(tick + 1);
-        toast("Hidden Channels: " + key + " " + (cfg[key] ? "on" : "off"));
+        note(key + " " + (cfg[key] ? "on" : "off"));
       }
 
       return h(RN.ScrollView, { style: { flex: 1, backgroundColor: C.bg }, contentContainerStyle: { padding: 12 } }, [
@@ -720,7 +737,19 @@
           h(RN.Text, { key: "p", style: { color: C.text, fontSize: 13, marginTop: 2 } },
             "Permission store: " + (stores.Permission ? "found" : "missing")),
           h(RN.Text, { key: "s", style: { color: C.text, fontSize: 13, marginTop: 2 } },
-            "Channel store: " + (stores.Channel ? "found" : "missing"))
+            "Channel store: " + (stores.Channel ? "found" : "missing")),
+          h(Btn, { key: "open", label: "open panel now", onPress: function () { openPanel(null); } })
+        ]),
+
+        h(Card, { key: "diag" }, [
+          h(RN.Text, { key: "h", style: { color: C.dim, fontSize: 11, marginBottom: 4 } }, "LAST LOAD"),
+          h(RN.Text, { key: "v", style: { color: C.text, fontSize: 13 } },
+            "v" + state.version + (state.loadedAt ? " \u00b7 " + state.loadedAt.replace("T", " ").slice(0, 19) : " \u00b7 not loaded this session")),
+          state.error
+            ? h(RN.Text, { key: "e", style: { color: C.bad, fontSize: 12, marginTop: 4 } }, "error: " + state.error)
+            : null,
+          h(RN.Text, { key: "l", style: { color: C.dim, fontSize: 11, marginTop: 6, fontFamily: "monospace" } },
+            state.events.length ? state.events.slice(-4).join("\n") : "no events yet")
         ]),
         h(List, { key: "list" + tick })
       ]);
@@ -744,12 +773,12 @@
   function openPanel(guildId) {
     var ui = getUI();
     if (!ui) {
-      toast("Hidden Channels: UI unavailable, check console");
+      note("panel unavailable: UI failed to build, see console");
       return;
     }
     var showCustomAlert = V.ui && V.ui.alerts && V.ui.alerts.showCustomAlert;
     if (!showCustomAlert) {
-      toast("Hidden Channels: alerts module missing");
+      note("panel unavailable: alerts module missing");
       return;
     }
     attempt(function () {
@@ -1030,11 +1059,14 @@
       applyPatches();
       armMenus();
       getUI();
-      log("v" + VERSION + " loaded", JSON.stringify(entryPoints));
-      toast("Hidden Channels v" + VERSION + " ready \u2014 hold a server \u2192 Hidden channels");
+      state.loadedAt = new Date().toISOString();
+      state.error = null;
+      note("loaded v" + VERSION + " \u00b7 surfaces " + JSON.stringify(entryPoints) +
+        " \u00b7 hold a server for the row");
     } catch (e) {
       logger.error("[HiddenChannels] load failed", e);
-      toast("Hidden Channels failed: " + ((e && e.message) || e));
+      state.error = String((e && e.message) || e);
+      state.events.push("load failed: " + state.error);
     }
   }
 
@@ -1074,6 +1106,7 @@
       bit: bit,
       probeChannel: probeChannel,
       openPanel: openPanel,
+      state: state,
       cfg: cfg
     }
   };
