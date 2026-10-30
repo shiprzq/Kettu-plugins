@@ -1,6 +1,6 @@
 {
   "name": "Hidden Channels",
-  "description": "Renders locked channels in the sidebar and gives you a full intel panel on every channel your role can't see: name, topic, ids, resolved overwrite matrix, your effective permission bits, and a live API probe of what the server actually hands back.",
+  "description": "Adds a Hidden channels button to every server. Reveals locked channels and gives a full intel panel: name, topic, ids, resolved overwrite matrix, effective permission bits, and a live API probe of what the server actually returns.",
   "authors": [
     {
       "name": "He",
@@ -8,7 +8,7 @@
     }
   ],
   "main": "index.js",
-  "hash": "7264cf8a05e233a63e6cac6a4d625ffa144f3657048ce42defcb79e4963e91f4",
+  "hash": "8631a1c16e20c28c832f93f9ccddd40cfb10ba1081511c8abee4b406c5cb65c6",
   "vendetta": {
     "icon": "ic_lock_24px"
   }
