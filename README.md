@@ -29,12 +29,16 @@ Two entry points, armed at load:
 
 | Surface | How it lands |
 | --- | --- |
-| Server long-press / server sheet (`showSimpleActionSheet`) | a **Hidden channels** row appended to the option list |
-| Lazily-imported guild and channel sheets (`openLazy`) | a row cloned from the sheet's own first row, appended to the same array |
+| Plain option sheets (`showSimpleActionSheet`) | a **Hidden channels** row appended to whatever row array the payload carries — `options`, `items`, or anything else that looks like a row list |
+| Lazily-imported sheets (`openLazy`) | a row cloned from the sheet's own first row type and appended to the same array |
+| `/` command | `/hidden` opens the panel from the composer |
+| Settings page | **open panel now** button, plus the full list |
 
 The row opens a modal panel scoped to that server. Sheets that aren't about a server — message actions, generic prompts — are left untouched: the hook only fires when the payload carries a guild object, or a channel that resolves to one.
 
-If neither hook finds its module, the settings page says so under **Surfaces** instead of failing silently. `settings` is the export Kettu actually reads (`pluginInstance[id]?.settings`); `Settings` is exported too for Vendetta-proper compatibility. Both render the same page.
+If a hook finds its module but no row appears, the **Sheet Watch** card records what the sheet actually handed over on the last open — payload shape, whether a guild was detected, how many rows were found. Copy it and it names the exact mismatch.
+
+If no hook finds its module, the settings page says so under **Surfaces** instead of failing silently. `settings` is the export Kettu actually reads (`pluginInstance[id]?.settings`); `Settings` is exported too for Vendetta-proper compatibility. Both render the same page.
 
 ## What the panel shows
 
