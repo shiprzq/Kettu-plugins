@@ -10,7 +10,7 @@
   var patcher = V.patcher;
   var logger = V.logger || console;
 
-  var VERSION = "2.0.1";
+  var VERSION = "2.0.2";
   var DEFAULTS = {
     reveal: true,        // force VIEW_CHANNEL through the local permission store
     attemptSend: true,   // force SEND_MESSAGES so the composer opens (server still decides)
@@ -71,16 +71,37 @@
     version: VERSION,
     loadedAt: null,
     error: null,
-    events: []
+    events: [],
+    probe: "no sheet activity recorded yet"
   };
+
+  var EVENT_LIMIT = 40;
 
   function note(message) {
     try {
       var line = String(message);
       state.events.push(line);
-      if (state.events.length > 12) state.events.shift();
+      while (state.events.length > EVENT_LIMIT) state.events.shift();
       log(line);
     } catch (e) { /* diagnostics are best-effort */ }
+  }
+
+  // What a payload is made of, without dumping megabytes into a log line.
+  function shape(v, depth) {
+    depth = depth || 0;
+    if (v === null) return "null";
+    if (v === undefined) return "undef";
+    if (Array.isArray(v)) {
+      return "arr[" + v.length + "]" + (v.length && depth < 3 ? "(" + shape(v[0], depth + 1) + ")" : "");
+    }
+    if (typeof v !== "object") return typeof v;
+    if (depth >= 3) return "{..}";
+    var keys = Object.keys(v);
+    var parts = [];
+    for (var i = 0; i < keys.length && i < 12; i++) {
+      parts.push(keys[i] + ":" + shape(v[keys[i]], depth + 1));
+    }
+    return "{" + parts.join(", ") + (keys.length > 12 ? ", +" + (keys.length - 12) : "") + "}";
   }
 
   /* ------------------------------------------------------------ metro find */
@@ -734,6 +755,8 @@
             "Server menu: " + (entryPoints.sheet ? "armed" : "not found")),
           h(RN.Text, { key: "c", style: { color: C.text, fontSize: 13, marginTop: 2 } },
             "Lazy sheet: " + (entryPoints.lazy ? "armed" : "not found")),
+          h(RN.Text, { key: "cmd", style: { color: C.text, fontSize: 13, marginTop: 2 } },
+            "/hidden command: " + (entryPoints.command ? "armed" : "not found")),
           h(RN.Text, { key: "p", style: { color: C.text, fontSize: 13, marginTop: 2 } },
             "Permission store: " + (stores.Permission ? "found" : "missing")),
           h(RN.Text, { key: "s", style: { color: C.text, fontSize: 13, marginTop: 2 } },
@@ -749,7 +772,33 @@
             ? h(RN.Text, { key: "e", style: { color: C.bad, fontSize: 12, marginTop: 4 } }, "error: " + state.error)
             : null,
           h(RN.Text, { key: "l", style: { color: C.dim, fontSize: 11, marginTop: 6, fontFamily: "monospace" } },
-            state.events.length ? state.events.slice(-4).join("\n") : "no events yet")
+            state.events.length ? state.events.slice(-6).join("\n") : "no events yet")
+        ]),
+
+        h(Card, { key: "probe" }, [
+          h(RN.Text, { key: "h", style: { color: C.dim, fontSize: 11, marginBottom: 4 } }, "SHEET WATCH"),
+          h(RN.Text, { key: "p", style: { color: C.text, fontSize: 12, fontFamily: "monospace" } }, state.probe),
+          h(RN.Text, { key: "n", style: { color: C.dim, fontSize: 11, marginTop: 6 } },
+            "Open a server menu, come back here, and this line shows what the sheet handed us. Copy it to me if the row is still missing."),
+          h(Btn, {
+            key: "copy", label: "copy diagnostics", flat: true,
+            onPress: function () {
+              var clip = attempt(function () { return metro.common.clipboard; }) || byProps("setString", "getString");
+              var dump = [
+                "Hidden Channels v" + state.version,
+                "loaded " + state.loadedAt,
+                "surfaces " + JSON.stringify(entryPoints),
+                "stores " + Object.keys(stores).filter(function (k) { return !!stores[k]; }).join(","),
+                "probe " + state.probe,
+                "events:",
+                state.events.slice(-20).join("\n")
+              ].join("\n");
+              if (clip && clip.setString) {
+                clip.setString(dump);
+                note("diagnostics copied (" + dump.length + " chars)");
+              }
+            }
+          })
         ]),
         h(List, { key: "list" + tick })
       ]);
@@ -864,7 +913,7 @@
 
   var unpatchPerms = [];
   var unpatchMenus = [];
-  var entryPoints = { sheet: false, lazy: false };
+  var entryPoints = { sheet: false, lazy: false, command: false };
 
   function pushPerm(fn) { if (typeof fn === "function") unpatchPerms.push(fn); }
   function pushMenu(fn) { if (typeof fn === "function") unpatchMenus.push(fn); }
@@ -934,7 +983,91 @@
 
   var ROW_LABEL = "Hidden channels";
 
-  /* 1. plain option-list sheets (server long-press, channel long-press) */
+  function isRowLike(o) {
+    if (!o || typeof o !== "object") return false;
+    if (typeof o.label === "string" && typeof o.onPress === "function") return true;
+    return !!(o.props && typeof o.props.label === "string" && typeof o.props.onPress === "function");
+  }
+
+  function isRowish(o) {
+    if (!o || typeof o !== "object") return false;
+    if (typeof o.label === "string") return true;
+    return !!(o.props && typeof o.props.label === "string");
+  }
+
+  // Sheets are handed to us as arbitrary props/context, so instead of trusting
+  // one key name we hunt for the first array that looks like a row list.
+  function rowArrayIn(node, depth, seen) {
+    depth = depth || 0;
+    seen = seen || [];
+    if (!node || typeof node !== "object" || depth > 4) return null;
+    if (seen.indexOf(node) !== -1) return null;
+    seen.push(node);
+
+    if (Array.isArray(node)) {
+      if (node.length && node.every(isRowish) && node.some(isRowLike)) return node;
+      for (var a = 0; a < node.length && a < 20; a++) {
+        var nested = rowArrayIn(node[a], depth + 1, seen);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    var keys = Object.keys(node);
+    var i;
+    for (i = 0; i < keys.length && i < 30; i++) {
+      var v = node[keys[i]];
+      if (Array.isArray(v) && v.length && v.every(isRowish) && v.some(isRowLike)) return v;
+    }
+    for (i = 0; i < keys.length && i < 30; i++) {
+      var found = rowArrayIn(node[keys[i]], depth + 1, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function hasOurRow(rows) {
+    return rows.some(function (r) {
+      return (r && r.label === ROW_LABEL) || (r && r.props && r.props.label === ROW_LABEL);
+    });
+  }
+
+  function addRow(rows, guild) {
+    if (!Array.isArray(rows)) return false;
+    try {
+      if (hasOurRow(rows)) return false;
+
+      var template = null;
+      for (var i = 0; i < rows.length; i++) if (isRowLike(rows[i])) { template = rows[i]; break; }
+
+      var press = function () {
+        hideSheet();
+        setTimeout(function () { openPanel(guild ? guild.id : null); }, 180);
+      };
+
+      if (template && template.props && template.type) {
+        var ui = getUI();
+        if (!ui) return false;
+        var templateProps = template.props || {};
+        var props = {};
+        for (var k in templateProps) props[k] = templateProps[k];
+        props.key = "hidden-channels-row";
+        props.label = ROW_LABEL;
+        props.onPress = press;
+        props.leading = undefined;
+        props.actions = undefined;
+        rows.push(ui.React.createElement(template.type, props));
+      } else {
+        rows.push({ label: ROW_LABEL, onPress: press });
+      }
+      return true;
+    } catch (e) {
+      note("row injection failed: " + ((e && e.message) || e));
+      return false;
+    }
+  }
+
+  /* 1. plain option-list sheets */
   function patchSimpleSheets() {
     var simple = stores.SimpleSheet;
     if (!simple || typeof simple.showSimpleActionSheet !== "function") {
@@ -946,67 +1079,19 @@
     pushMenu(patcher.after("showSimpleActionSheet", simple, function (args) {
       var payload = args && args[0];
       if (!payload || typeof payload !== "object") return;
-      var options = payload.options;
-      if (!Array.isArray(options)) return;
-      if (options.some(function (o) { return o && o.label === ROW_LABEL; })) return;
 
       var guild = guildFrom(payload);
-      if (!guild) return;
+      var rows = rowArrayIn(payload, 0, []);
+      state.probe = "simple sheet \u00b7 guild " + (guild ? "yes" : "no") +
+        " \u00b7 rows " + (rows ? rows.length : "none");
+      note("simple sheet seen \u00b7 " + shape(payload).slice(0, 220));
 
-      options.push({
-        label: ROW_LABEL,
-        onPress: function () {
-          hideSheet();
-          setTimeout(function () { openPanel(guild.id); }, 180);
-        }
-      });
-      dbg("injected row into simple sheet for", guildName(guild));
+      if (!guild || !rows) return;
+      if (addRow(rows, guild)) note("row added to simple sheet \u00b7 " + guildName(guild));
     }));
   }
 
-  /* 2. lazily-imported sheets (newer Discord server/channel sheets) */
-  function injectRowIntoTree(tree, guild) {
-    var utils = V.utils || {};
-    if (typeof utils.findInReactTree !== "function") return tree;
-    try {
-      var rows = utils.findInReactTree(tree, function (node) {
-        return Array.isArray(node) && node.length > 0 && node.every(function (r) {
-          return r && typeof r === "object" && r.props && typeof r.props.label === "string" &&
-            typeof r.props.onPress === "function";
-        });
-      });
-      if (!rows || !Array.isArray(rows)) return tree;
-      var dupe = rows.some(function (r) { return r.props.label === ROW_LABEL; });
-      if (dupe) return tree;
-
-      var template = rows[0];
-      var rowType = template && template.type;
-      if (!rowType) return tree;
-
-      rows.push(h0(rowType, {
-        key: "hidden-channels-row",
-        label: ROW_LABEL,
-        onPress: function () {
-          hideSheet();
-          setTimeout(function () { openPanel(guild.id); }, 180);
-        },
-        leading: undefined
-      }, template.props && template.props.label ? template.props.label : ROW_LABEL));
-      dbg("injected row into lazy sheet for", guildName(guild));
-    } catch (e) {
-      dbg("lazy row injection failed", e);
-    }
-    return tree;
-  }
-
-  function h0(type, props, child) {
-    var ui = getUI();
-    if (!ui) return null;
-    return child === undefined
-      ? ui.React.createElement(type, props)
-      : ui.React.createElement(type, props, child);
-  }
-
+  /* 2. lazily-imported sheets */
   function patchLazySheets() {
     var lazy = stores.LazySheet;
     if (!lazy || typeof lazy.openLazy !== "function") {
@@ -1020,23 +1105,63 @@
         var component = args[0];
         var key = args[1];
         var context = args[2];
-        if (typeof key !== "string") return;
-        if (!/guild|Guild|channel|Channel/.test(key)) return;
 
         var guild = guildFrom(context);
-        if (!guild) return;
+        state.probe = "openLazy " + String(key) + " \u00b7 guild " + (guild ? "yes" : "no");
+        note("openLazy " + String(key) + " \u00b7 " + shape(context).slice(0, 220));
 
+        if (!guild) return;
         if (!component || typeof component.then !== "function") return;
+
         component.then(function (instance) {
           if (!instance || !instance.default) return;
           pushMenu(patcher.after("default", instance, function (props, tree) {
-            return injectRowIntoTree(tree, guild);
+            try {
+              if (!tree) return tree;
+              var rows = rowArrayIn(tree, 0, []);
+              if (rows && addRow(rows, guild)) {
+                note("row added to lazy sheet " + String(key) + " \u00b7 " + guildName(guild));
+                return tree;
+              }
+              var utils = V.utils || {};
+              if (typeof utils.findInReactTree === "function") {
+                var located = utils.findInReactTree(tree, function (node) {
+                  return Array.isArray(node) && node.length && node.every(isRowish) && node.some(isRowLike);
+                });
+                if (located && addRow(located, guild)) {
+                  note("row added via findInReactTree \u00b7 " + guildName(guild));
+                }
+              }
+            } catch (e) {
+              note("lazy inject failed: " + ((e && e.message) || e));
+            }
+            return tree;
           }));
         });
       } catch (e) {
-        dbg("lazy sheet hook failed", e);
+        note("lazy hook failed: " + ((e && e.message) || e));
       }
     }));
+  }
+
+  /* 3. slash command, for when no sheet cooperates */
+  var commandUnpatch = null;
+
+  function registerCommandEntry() {
+    entryPoints.command = false;
+    if (commandUnpatch) return;
+    try {
+      if (!V.commands || typeof V.commands.registerCommand !== "function") return;
+      commandUnpatch = V.commands.registerCommand({
+        name: "hidden",
+        description: "Open Hidden Channels",
+        execute: function () { openPanel(null); }
+      }) || true;
+      entryPoints.command = true;
+      note("registered /hidden command");
+    } catch (e) {
+      note("command registration failed: " + ((e && e.message) || e));
+    }
   }
 
   function armMenus() {
@@ -1047,7 +1172,8 @@
     entryPoints.lazy = false;
     patchSimpleSheets();
     patchLazySheets();
-    dbg("entry points", JSON.stringify(entryPoints));
+    registerCommandEntry();
+    note("entry points " + JSON.stringify(entryPoints));
   }
 
   /* ------------------------------------------------------------ lifecycle */
@@ -1072,6 +1198,10 @@
 
   function onUnload() {
     dropPermPatches();
+    if (typeof commandUnpatch === "function") {
+      try { commandUnpatch(); } catch (e) { /* already gone */ }
+    }
+    commandUnpatch = null;
     while (unpatchMenus.length) {
       try { unpatchMenus.pop()(); } catch (e) { /* already gone */ }
     }
